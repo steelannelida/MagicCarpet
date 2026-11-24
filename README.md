@@ -21,6 +21,10 @@ Open `prototype/index.html` in Chrome and press **POWER**. No build step and no 
 
 Controls: drag a knob or note, Shift for fine, mouse wheel, double-click a knob to reset.
 
+## Spec
+
+The project is spec-driven: `spec/` describes the current state and is the source of truth. See `spec/README.md`.
+
 ## Layout
 
 - `prototype/index.html`: the whole app. Engine (AudioWorklet), patch model and canvas UI are in one file.
