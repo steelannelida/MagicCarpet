@@ -1,0 +1,49 @@
+<!doctype html><meta charset="utf-8"><pre id="o">running</pre>
+<script>
+// Offline engine test: renders the real engine/model code from index.html, no audio device needed.
+// Run:  chrome --headless --allow-file-access-from-files --virtual-time-budget=20000 --dump-dom test.html
+(async () => {
+  const out = [], log = s => out.push(s);
+  try {
+    const html = await (await fetch('index.html')).text();
+    const grab = id => html.match(new RegExp('<script id="' + id + '"[^>]*>([\\s\\S]*?)<\\/script>'))[1];
+    const { Engine } = new Function(grab('engine-src') + ';return {Engine};')();
+    const { buildPatch, computeEdges } = new Function(grab('model') + ';return {buildPatch,computeEdges};')();
+    const sr = 48000, patch = buildPatch(), edges = computeEdges(patch.cubes);
+    const topo = { cubes: patch.cubes.map(({id,type,w,knob,on,params}) => ({id,type,w,knob,on,params:params||{}})),
+                   edges: edges.map(({from,out,to,inp}) => ({from,out,to,inp})) };
+    log(`cubes=${topo.cubes.length} edges=${topo.edges.length} order=${new Engine(sr).order.length}`);
+    const e = new Engine(sr); e.setTopology(topo);
+    log(`order=${e.order.length} (all cubes scheduled: ${e.order.length === topo.cubes.length})`);
+    const secs = 4, N = sr * secs, buf = new Float32Array(N);
+    for (let t = 0; t < N; t += 128) { e.process(128); buf.set(e.mix, t); }
+    let peak = 0, bad = 0; for (const v of buf) { if (!isFinite(v)) bad++; peak = Math.max(peak, Math.abs(v)); }
+    log(`peak=${peak.toFixed(3)} nonFinite=${bad}`);
+
+    const goertzel = (x, f) => { let re = 0, im = 0; for (let i = 0; i < x.length; i++) { const a = 2*Math.PI*f*i/sr; re += x[i]*Math.cos(a); im += x[i]*Math.sin(a); } return 2*Math.hypot(re, im)/x.length; };
+    const hz = n => 16.351597831287414 * 2 ** (n / 12);
+    const voices = [-6, -12, -16], master = Math.pow(10, -6/20);
+    const notes = [[24,24,24,27,24,24,31,22],[48,51,55,58,55,51,55,48],[60,60,63,67,60,58,67,70]];
+    const ons = [[1,0,0,1,0,1,0,1],[0,1,1,0,1,1,0,1],[1,0,0,1,0,0,1,0]];
+    let fails = 0;
+    for (let s = 0; s < 8; s++) {
+      const a = Math.round((s * 0.25 + 0.05) * sr), b = Math.round((s * 0.25 + 0.2) * sr), w = buf.subarray(a, b);
+      const row = [];
+      for (let v = 0; v < 3; v++) {
+        const f = hz(notes[v][s]), amp = goertzel(w, f), want = ons[v][s] ? Math.pow(10, voices[v]/20) * master : 0;
+        const ok = ons[v][s] ? Math.abs(amp - want) < 0.25 * want : amp < 0.02;
+        if (!ok) fails++;
+        row.push(`${['bass','mid','lead'][v]}:${amp.toFixed(3)}/${want.toFixed(3)}${ok ? '' : ' FAIL'}`);
+      }
+      log(`step ${s}: ` + row.join('  '));
+    }
+    // knob + stop commands mid-render must not produce NaN; stop must silence
+    e.apply({ op: 'setKnob', id: 'v0s0', value: 40 }); e.apply({ op: 'setOn', id: 'clock', value: false });
+    let tail = 0; for (let t = 0; t < sr; t += 128) { e.process(128); if (t > sr/2) for (let i=0;i<128;i++) tail = Math.max(tail, Math.abs(e.mix[i])); }
+    log(`after stop: tail peak=${tail.toExponential(2)} ${tail < 1e-9 ? 'OK' : 'FAIL'}`);
+    const st = e.takeStats(); log(`stats edges=${st.pk.length}`);
+    log(fails || bad || tail >= 1e-9 ? 'RESULT: FAIL' : 'RESULT: PASS');
+  } catch (err) { log('ERROR ' + err.stack); }
+  document.getElementById('o').textContent = out.join('\n');
+})();
+</script>

@@ -1,0 +1,624 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cube Grid — prototype 0</title>
+<style>
+  :root { --bg:#07090d; --ink:#cfe3ff; --dim:#51627a; --line:#151c27; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink); overflow:hidden;
+    font:12px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header { position:fixed; inset:0 0 auto 0; height:44px; box-sizing:border-box; padding:0 16px;
+    display:flex; align-items:center; gap:14px; border-bottom:1px solid var(--line); }
+  header b { letter-spacing:.18em; font-weight:600; }
+  header .hint { color:var(--dim); margin-left:auto; text-align:right; }
+  #power { font:inherit; color:var(--ink); background:none; cursor:pointer; letter-spacing:.12em;
+    border:1px solid #2a3647; border-radius:14px; padding:4px 12px 4px 10px; display:flex; align-items:center; gap:8px; }
+  #power i { width:8px; height:8px; border-radius:50%; background:#2a3647; display:block; }
+  #power.on { border-color:#3ddc97; } #power.on i { background:#3ddc97; box-shadow:0 0 8px #3ddc97; }
+  #status { color:var(--dim); }
+  canvas { position:fixed; left:0; top:44px; width:100%; height:calc(100% - 44px); display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<header>
+  <b>CUBE GRID</b>
+  <button id="power"><i></i><span>POWER</span></button>
+  <span id="status">engine off</span>
+  <span class="hint">drag a knob or a note · shift = fine · wheel · double-click a knob = reset · click a step to bypass it</span>
+</header>
+<canvas id="cv"></canvas>
+
+<!-- ============================ ENGINE ============================
+     Runs inside an AudioWorklet (loaded from a Blob), and in the offline test.
+     Knows nothing about the UI: it takes a topology table and commands. -->
+<script id="engine-src" type="text/plain">
+'use strict';
+const BLOCK = 128;
+const C0_HZ = 16.351597831287414;
+const TAU = 2 * Math.PI;
+const dbToGain = db => db <= -60 ? 0 : Math.pow(10, db / 20);
+
+// Prototype note: signal buffers are Float64 so unwrapped phase ramps keep precision.
+// The design doc says fp32; revisit when the C++ engine starts.
+
+function passS(c, n) {                         // default S = N
+  for (let j = 0; j < c.w; j++) c.S[j].set(c.N[j].subarray(0, n));
+}
+
+const TYPES = {
+  // Whole-sequence ramp in (0,1]; 0 while stopped. Knob = BPM, params.beats = beats per cycle.
+  clock(c, n, e) {
+    const E = c.E, beats = c.params.beats || 4;
+    let ph = c.state.phase;
+    for (let i = 0; i < n; i++) {
+      if (!c.on) { ph = 0; E[i] = 0; continue; }
+      const bpm = c.k0 + (c.k1 - c.k0) * (i / n);
+      ph += bpm / (60 * beats * e.sr);
+      if (ph > 1) ph -= 1;
+      E[i] = ph;
+    }
+    c.state.phase = ph;
+    passS(c, n);
+  },
+
+  // W: whole-sequence ramp. S[j]: ramp (0,1] within step j while it is playing, else 0. E: W passes on.
+  seq(c, n) {
+    const W = c.W, E = c.E, S = c.S, w = c.w;
+    for (let i = 0; i < n; i++) {
+      const x = W[i];
+      let idx = -1, loc = 0;
+      if (x > 0) {
+        const k = x * w;
+        idx = Math.ceil(k) - 1;
+        if (idx < 0) idx = 0; else if (idx >= w) idx = w - 1;
+        loc = Math.min(1, k - idx);
+      }
+      for (let j = 0; j < w; j++) S[j][i] = (j === idx) ? loc : 0;
+      E[i] = x;
+    }
+  },
+
+  // N -> S always. While its column plays and it is on: E = own unwrapped phase ramp at the knob pitch.
+  // Otherwise E = W (bypass). Knob = pitch, 1 per semitone, 0 = C0.
+  step(c, n, e) {
+    const W = c.W, N = c.N[0], S = c.S[0], E = c.E, on = c.on;
+    const f0 = C0_HZ * Math.pow(2, c.k0 / 12) / e.sr;
+    const f1 = C0_HZ * Math.pow(2, c.k1 / 12) / e.sr;
+    let ph = c.state.phase;
+    for (let i = 0; i < n; i++) {
+      const nv = N[i];
+      S[i] = nv;
+      if (nv > 0) ph += f0 + (f1 - f0) * (i / n); else ph = 0;
+      E[i] = (on && nv > 0) ? ph : W[i];
+    }
+    c.state.phase = ph;
+  },
+
+  phasor(c, n) {
+    const W = c.W, E = c.E;
+    for (let i = 0; i < n; i++) { const x = W[i]; E[i] = x - Math.floor(x); }
+    passS(c, n);
+  },
+
+  sine(c, n) {
+    const W = c.W, E = c.E;
+    for (let i = 0; i < n; i++) E[i] = Math.sin(TAU * W[i]);
+    passS(c, n);
+  },
+
+  // E = W; S = N + W * gain. Knob = dB.
+  mix(c, n) {
+    const W = c.W, N = c.N[0], E = c.E, S = c.S[0];
+    const g0 = dbToGain(c.k0), g1 = dbToGain(c.k1);
+    for (let i = 0; i < n; i++) {
+      const g = g0 + (g1 - g0) * (i / n);
+      E[i] = W[i];
+      S[i] = N[i] + W[i] * g;
+    }
+  },
+
+  // Master: sums W and N, gain in dB, soft limiter. Its E is what you hear.
+  out(c, n) {
+    const W = c.W, N = c.N[0], E = c.E;
+    const g0 = dbToGain(c.k0), g1 = dbToGain(c.k1);
+    for (let i = 0; i < n; i++) {
+      const g = g0 + (g1 - g0) * (i / n);
+      E[i] = Math.tanh((W[i] + N[i]) * g);
+    }
+  },
+};
+
+class Engine {
+  constructor(sr) {
+    this.sr = sr;
+    this.cubes = new Map();
+    this.order = [];
+    this.edgeSrc = [];
+    this.pk = new Float64Array(0);
+    this.last = new Float64Array(0);
+    this.zero = new Float64Array(BLOCK);
+    this.mix = new Float64Array(BLOCK);
+    this.alpha = 1 - Math.exp(-(BLOCK / sr) / 0.005);   // ~5 ms knob smoothing
+  }
+
+  // topo = { cubes:[{id,type,w,knob,on,params}], edges:[{from,out:'E'|'S<j>',to,inp:'W'|'N<j>'}] }
+  // Cube runtime state is keyed by id, so a new topology never resets phases.
+  setTopology(topo) {
+    const old = this.cubes, next = new Map();
+    for (const s of topo.cubes) {
+      let c = old.get(s.id);
+      if (!c || c.type !== s.type) c = { id: s.id, type: s.type, state: { phase: 0 }, kv: s.knob };
+      if (!c.E || c.w !== s.w) {
+        c.E = new Float64Array(BLOCK);
+        c.S = Array.from({ length: s.w }, () => new Float64Array(BLOCK));
+      }
+      c.w = s.w; c.params = s.params || {}; c.target = s.knob; c.on = s.on;
+      c.k0 = c.k1 = c.kv;
+      c.W = this.zero;
+      c.N = Array.from({ length: s.w }, () => this.zero);
+      next.set(s.id, c);
+    }
+    this.cubes = next;
+
+    const indeg = new Map([...next.keys()].map(id => [id, 0]));
+    const succ = new Map([...next.keys()].map(id => [id, []]));
+    this.edgeSrc = topo.edges.map(e => {
+      const a = next.get(e.from), b = next.get(e.to);
+      if (!a || !b) return null;
+      const src = e.out === 'E' ? a.E : a.S[+e.out.slice(1)];
+      if (e.inp === 'W') b.W = src; else b.N[+e.inp.slice(1)] = src;
+      indeg.set(e.to, indeg.get(e.to) + 1);
+      succ.get(e.from).push(e.to);
+      return src;
+    });
+    // Kahn topological order. Without portals the graph is a DAG by construction.
+    const q = [...indeg].filter(([, d]) => d === 0).map(([id]) => id), order = [];
+    while (q.length) {
+      const id = q.shift(); order.push(next.get(id));
+      for (const t of succ.get(id)) { indeg.set(t, indeg.get(t) - 1); if (indeg.get(t) === 0) q.push(t); }
+    }
+    this.order = order;
+    this.pk = new Float64Array(topo.edges.length);
+    this.last = new Float64Array(topo.edges.length);
+  }
+
+  apply(cmd) {
+    const c = this.cubes.get(cmd.id);
+    if (!c) return;
+    if (cmd.op === 'setKnob') c.target = cmd.value;
+    else if (cmd.op === 'setOn') c.on = cmd.value;
+  }
+
+  process(n) {                                   // n <= BLOCK; result in this.mix
+    for (const c of this.order) {
+      const d = c.target - c.kv;
+      c.k0 = c.kv;
+      c.kv = Math.abs(d) < 1e-9 ? c.target : c.kv + d * this.alpha;
+      c.k1 = c.kv;
+    }
+    for (const c of this.order) { const f = TYPES[c.type]; if (f) f(c, n, this); }
+    const m = this.mix;
+    m.fill(0);
+    for (const c of this.order) if (c.type === 'out') for (let i = 0; i < n; i++) m[i] += c.E[i];
+    for (let k = 0; k < this.edgeSrc.length; k++) {
+      const b = this.edgeSrc[k]; if (!b) continue;
+      let p = this.pk[k];
+      for (let i = 0; i < n; i++) { const v = Math.abs(b[i]); if (v > p) p = v; }
+      this.pk[k] = p; this.last[k] = b[n - 1];
+    }
+  }
+
+  takeStats() {
+    const s = { pk: Float32Array.from(this.pk), last: Float32Array.from(this.last) };
+    this.pk.fill(0);
+    return s;
+  }
+}
+
+if (typeof registerProcessor === 'function') {
+  registerProcessor('cubegrid', class extends AudioWorkletProcessor {
+    constructor() {
+      super();
+      this.e = new Engine(sampleRate);
+      this.since = 0;
+      this.port.onmessage = ev => {
+        const m = ev.data;
+        if (m.t === 'topo') this.e.setTopology(m.topo);
+        else if (m.t === 'cmd') this.e.apply(m.cmd);
+      };
+    }
+    process(inputs, outputs) {
+      const out = outputs[0], len = out[0].length, e = this.e;
+      for (let off = 0; off < len; off += BLOCK) {
+        const n = Math.min(BLOCK, len - off);
+        e.process(n);
+        for (const ch of out) for (let i = 0; i < n; i++) ch[off + i] = e.mix[i];
+      }
+      this.since += len;
+      if (this.since >= 2048) {
+        this.since = 0;
+        this.port.postMessage({ t: 'stats', ...e.takeStats() });
+      }
+      return true;
+    }
+  });
+}
+</script>
+
+<!-- ============================ MODEL ============================
+     The demo patch and the geometry -> edges rule. Pure functions. -->
+<script id="model">
+
+// x,y = grid cell, w = width in cells (height is always 1 for now).
+// Pitch knob: 1 per semitone, 0 = C0 (48 = C4, 60 = C5).
+function buildPatch() {
+  const steps = 8;
+  const voices = [
+    { name: 'bass', clef: 'bass', gain: -6,  notes: [24,24,24,27,24,24,31,22], on: [1,0,0,1,0,1,0,1] },
+    { name: 'mid',  clef: 'treble', gain: -12, notes: [48,51,55,58,55,51,55,48], on: [0,1,1,0,1,1,0,1] },
+    { name: 'lead', clef: 'treble', gain: -16, notes: [60,60,63,67,60,58,67,70], on: [1,0,0,1,0,0,1,0] },
+  ];
+  const cubes = [
+    { id: 'clock', type: 'clock', x: 0, y: 0, w: 1, knob: 120, on: true, params: { beats: 4 } },
+    { id: 'seq',   type: 'seq',   x: 1, y: 0, w: steps, knob: 0, on: true },
+  ];
+  voices.forEach((v, i) => {
+    const y = 1 + i;
+    for (let s = 0; s < steps; s++)
+      cubes.push({ id: `v${i}s${s}`, type: 'step', x: 1 + s, y, w: 1, knob: v.notes[s], on: !!v.on[s], clef: v.clef });
+    cubes.push({ id: `v${i}ph`,  type: 'phasor', x: 1 + steps, y, w: 1, knob: 0, on: true });
+    cubes.push({ id: `v${i}sin`, type: 'sine',   x: 2 + steps, y, w: 1, knob: 0, on: true });
+    cubes.push({ id: `v${i}mix`, type: 'mix',    x: 3 + steps, y, w: 1, knob: v.gain, on: true });
+  });
+  cubes.push({ id: 'out', type: 'out', x: 3 + steps, y: 1 + voices.length, w: 1, knob: -6, on: true });
+  const stickers = voices.map((v, i) => ({ x: 0, y: 1 + i, text: v.name }));
+  return { cubes, stickers };
+}
+
+// Placement is patching: E->W and S->N between neighbouring cells.
+// A multi-cell cube takes W at its leftmost cell, gives E at its rightmost; every cell has its own N and S.
+function computeEdges(cubes) {
+  const cell = new Map();
+  for (const c of cubes) for (let i = 0; i < c.w; i++) cell.set((c.x + i) + ',' + c.y, { c, i });
+  const edges = [];
+  for (const [key, { c, i }] of cell) {
+    const [x, y] = key.split(',').map(Number);
+    if (i === c.w - 1) {
+      const nb = cell.get((x + 1) + ',' + y);
+      if (nb && nb.i === 0) edges.push({ from: c.id, out: 'E', to: nb.c.id, inp: 'W', x, y, dir: 'E' });
+    }
+    const nb = cell.get(x + ',' + (y + 1));
+    if (nb) edges.push({ from: c.id, out: 'S' + i, to: nb.c.id, inp: 'N' + nb.i, x, y, dir: 'S' });
+  }
+  return edges;
+}
+</script>
+
+<!-- ============================ UI ============================ -->
+<script id="ui">
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const patch = buildPatch();
+const cubes = patch.cubes;
+const byId = Object.fromEntries(cubes.map(c => [c.id, c]));
+cubes.forEach(c => c.def = c.knob);
+const edges = computeEdges(cubes);
+const edgeIdx = {};                                     // 'cubeId:port' -> edge index
+edges.forEach((e, i) => { edgeIdx[e.from + ':' + e.out] = i; edgeIdx[e.to + ':' + e.inp] = i; });
+const maxX = Math.max(...cubes.map(c => c.x + c.w - 1)), maxY = Math.max(...cubes.map(c => c.y));
+
+const topology = () => ({
+  cubes: cubes.map(({ id, type, w, knob, on, params }) => ({ id, type, w, knob, on, params: params || {} })),
+  edges: edges.map(({ from, out, to, inp }) => ({ from, out, to, inp })),
+});
+
+// ---- display definitions: hue encodes the expected scale (cyan ramp, amber phase/pitch, magenta audio)
+const HUE = { ramp: 190, phase: 35, audio: 320, master: 150 };
+const fmtNote = v => {
+  const n = Math.round(v), cents = Math.round((v - n) * 100);
+  const [l, acc] = SPELL[((n % 12) + 12) % 12];
+  const name = 'CDEFGAB'[l] + (acc ? '\u266D' : '') + Math.floor(n / 12);
+  const hz = 16.3516 * Math.pow(2, v / 12);
+  return [name + (cents ? (cents > 0 ? '+' : '') + cents + 'c' : ''), (hz < 100 ? hz.toFixed(1) : hz.toFixed(0)) + ' Hz'];
+};
+const fmtDb = v => [v <= -60 ? '-inf' : v.toFixed(1), 'dB'];
+const DEFS = {
+  clock:  { label: 'CLOCK', hue: HUE.ramp, hueE: HUE.ramp, hueS: HUE.ramp, toggle: ['■ STOP', '▶ PLAY'],
+            knob: { min: 20, max: 300, step: 1, fmt: v => [v.toFixed(0), 'BPM'] } },
+  seq:    { label: 'SEQUENCER', hue: HUE.ramp, hueE: HUE.ramp, hueS: HUE.ramp },
+  step:   { label: 'STEP', hue: HUE.phase, hueE: HUE.phase, hueS: HUE.ramp, toggle: ['bypass', 'on'], staff: true },
+  phasor: { label: 'PHASOR', hue: HUE.phase, hueE: HUE.phase, hueS: HUE.ramp, glyph: 'saw' },
+  sine:   { label: 'SINE', hue: HUE.audio, hueE: HUE.audio, hueS: HUE.ramp, glyph: 'sine' },
+  mix:    { label: 'MIX', hue: HUE.audio, hueE: HUE.audio, hueS: HUE.audio,
+            knob: { min: -60, max: 6, step: 0.5, fmt: fmtDb } },
+  out:    { label: 'OUT', hue: HUE.master, hueE: HUE.master, hueS: HUE.master,
+            knob: { min: -60, max: 0, step: 0.5, fmt: fmtDb } },
+};
+
+// ---- commands: every edit is a serialisable command (undo / jam / tests come from this later)
+const commandLog = [];
+function dispatch(cmd) {
+  commandLog.push(cmd);
+  const c = byId[cmd.id];
+  if (cmd.op === 'setKnob') { c.knob = cmd.value; if (c.type === 'step') fitClef(c); } else if (cmd.op === 'setOn') c.on = cmd.value;
+  if (node) node.port.postMessage({ t: 'cmd', cmd });
+}
+
+// ---- audio power
+let actx = null, node = null, powered = false;
+let levels = { pk: [], last: [] };
+const powerBtn = document.getElementById('power'), statusEl = document.getElementById('status');
+async function setPower(on) {
+  try {
+    if (on) {
+      if (!actx) {
+        actx = new AudioContext({ latencyHint: 'interactive' });
+        const resumed = actx.resume();                  // inside the user gesture (Safari)
+        const src = document.getElementById('engine-src').textContent;
+        await actx.audioWorklet.addModule(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        node = new AudioWorkletNode(actx, 'cubegrid', { numberOfInputs: 0, outputChannelCount: [2] });
+        node.port.onmessage = ev => { if (ev.data.t === 'stats') levels = ev.data; };
+        node.connect(actx.destination);
+        node.port.postMessage({ t: 'topo', topo: topology() });
+        await resumed;
+      } else await actx.resume();
+    } else if (actx) { await actx.suspend(); levels = { pk: [], last: [] }; }
+    powered = on;
+    statusEl.textContent = on ? `engine running · ${actx.sampleRate} Hz` : 'engine off';
+  } catch (err) { statusEl.textContent = 'audio error: ' + err.message; console.error(err); }
+  powerBtn.classList.toggle('on', powered);
+}
+powerBtn.onclick = () => setPower(!powered);
+
+// ---- layout: cells are flush squares of size u; the grid lines run across the whole canvas
+let u = 90, ox = 0, oy = 0, dpr = 1;
+function layout() {
+  dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight, pad = 28;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const cols = maxX + 1, rows = maxY + 1;
+  u = Math.min((W - 2 * pad) / cols, (H - 2 * pad) / rows, 120);
+  ox = Math.round((W - cols * u) / 2);
+  oy = Math.round((H - rows * u) / 2);
+}
+window.addEventListener('resize', layout);
+const cellX = x => ox + x * u, cellY = y => oy + y * u;
+const rectOf = c => ({ x: cellX(c.x), y: cellY(c.y), w: c.w * u, h: u });
+function knobGeom(c) { const r = rectOf(c); return { x: r.x + r.w / 2, y: r.y + u * 0.47, R: u * 0.25 }; }
+const col = (h, s, l, a = 1) => `hsla(${h},${s}%,${l}%,${a})`;
+const lastOf = key => { const i = edgeIdx[key]; return i === undefined ? 0 : (levels.last[i] || 0); };
+
+// ---- notation
+// Natural/flat spelling per pitch class -> [letter index (C=0..B=6), accidental]. dsi = diatonic step index (octave*7+letter).
+const SPELL = [[0,0],[1,-1],[1,0],[2,-1],[2,0],[3,0],[4,-1],[4,0],[5,-1],[5,0],[6,-1],[6,0]];
+// Clef ladder. bottom = dsi of the bottom staff line (sounding pitch), mark = the line the clef curls around,
+// ott = octave marking printed with the clef. A step keeps its clef until the note leaves its window, then it
+// takes the clef whose staff is centred nearest: the whole C0..C8 range is reachable on every step.
+const G = '\u{1D11E}', F = '\u{1D122}';
+const CLEF = {
+  bass15:   { bottom: 4,  glyph: F, mark: 8,  ott: '15', below: true },
+  bass8:    { bottom: 11, glyph: F, mark: 15, ott: '8',  below: true },
+  bass:     { bottom: 18, glyph: F, mark: 22 },                      // bottom line G2
+  treble:   { bottom: 30, glyph: G, mark: 32 },                      // bottom line E4, curls on G4
+  treble8:  { bottom: 37, glyph: G, mark: 39, ott: '8' },
+  treble15: { bottom: 44, glyph: G, mark: 46, ott: '15' },
+};
+const inWindow = (k, dsi) => dsi >= CLEF[k].bottom - 5 && dsi <= CLEF[k].bottom + 13;
+function fitClef(c) {
+  const { dsi } = spell(c.knob);
+  if (inWindow(c.clef, dsi)) return;
+  let best = c.clef, bd = Infinity;
+  for (const k in CLEF) if (inWindow(k, dsi)) { const d = Math.abs(dsi - (CLEF[k].bottom + 4)); if (d < bd) { bd = d; best = k; } }
+  c.clef = best;
+}
+function spell(semi) {
+  const n = Math.round(semi), [l, acc] = SPELL[((n % 12) + 12) % 12];
+  return { dsi: Math.floor(n / 12) * 7 + l, acc };
+}
+// The knob of a cube: a step covers the whole note range, 6 px per semitone.
+function knobOf(c) {
+  if (c.type === 'step') return { min: 0, max: 96, step: 1, px: 6 };
+  return DEFS[c.type].knob;
+}
+
+// ---- drawing
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+function text(s, x, y, size, color, align = 'center', family = 'ui-monospace, SFMono-Regular, Menlo, monospace') {
+  ctx.font = `${size}px ${family}`;
+  ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillText(s, x, y);
+}
+
+function drawGrid() {
+  const W = cv.clientWidth, H = cv.clientHeight;
+  ctx.strokeStyle = 'rgba(170,185,210,0.13)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let x = ox - Math.ceil(ox / u) * u; x <= W; x += u) { const px = Math.round(x) + 0.5; ctx.moveTo(px, 0); ctx.lineTo(px, H); }
+  for (let y = oy - Math.ceil(oy / u) * u; y <= H; y += u) { const py = Math.round(y) + 0.5; ctx.moveTo(0, py); ctx.lineTo(W, py); }
+  ctx.stroke();
+}
+
+function drawKnob(c, def) {
+  const k = def.knob, t = (c.knob - k.min) / (k.max - k.min), { x, y, R } = knobGeom(c);
+  const a0 = Math.PI * 0.75, a1 = Math.PI * 2.25;
+  ctx.lineCap = 'round'; ctx.lineWidth = Math.max(2, u * 0.035);
+  ctx.strokeStyle = col(def.hue, 25, 28); ctx.beginPath(); ctx.arc(x, y, R, a0, a1); ctx.stroke();
+  ctx.strokeStyle = col(def.hue, 90, 62); ctx.beginPath(); ctx.arc(x, y, R, a0, a0 + (a1 - a0) * t); ctx.stroke();
+  const a = a0 + (a1 - a0) * t;
+  ctx.beginPath(); ctx.moveTo(x + Math.cos(a) * R * 0.35, y + Math.sin(a) * R * 0.35);
+  ctx.lineTo(x + Math.cos(a) * R * 0.85, y + Math.sin(a) * R * 0.85); ctx.stroke();
+  const [m, s] = k.fmt(c.knob), r = rectOf(c);
+  text(m, x, r.y + u * 0.80, u * 0.15, col(def.hue, 60, 85));
+  text(s, x, r.y + u * 0.92, u * 0.11, col(def.hue, 25, 55));
+}
+
+// A quarter note on a five-line staff; the staff runs edge to edge so neighbouring steps read as one line of music.
+function drawStaff(c, d, r, active) {
+  const clef = CLEF[c.clef], sp = u * 0.08, hue = d.hue;
+  const bottomY = r.y + u * 0.5 + 2 * sp;
+  const yOf = dsi => bottomY - (dsi - clef.bottom) * sp / 2;
+  const dim = c.on ? 1 : 0.45;
+  ctx.lineWidth = 1; ctx.strokeStyle = col(hue, 25, 42, dim); ctx.beginPath();
+  for (let k = 0; k < 5; k++) { const y = Math.round(yOf(clef.bottom + 2 * k)) + 0.5; ctx.moveTo(r.x, y); ctx.lineTo(r.x + u, y); }
+  ctx.stroke();
+
+  const treble = clef.glyph === G;
+  text(clef.glyph, r.x + u * 0.17, yOf(clef.mark) + (treble ? sp * 0.8 : 0), sp * 7.2,
+       col(hue, 30, 62, dim), 'center', '"Noto Music","Apple Symbols","Segoe UI Symbol",serif');
+  if (clef.ott) text(clef.ott, r.x + u * 0.17, clef.below ? bottomY + sp * 1.5 : r.y + u * 0.19, u * 0.1, col(hue, 30, 62, dim));
+
+  const { dsi, acc } = spell(c.knob), nx = r.x + u * 0.64, ny = yOf(dsi);
+  const rx = sp * 0.68, ry = sp * 0.5;
+  ctx.strokeStyle = col(hue, 25, 55, dim);                        // ledger lines
+  ctx.beginPath();
+  for (let d = clef.bottom - 2; d >= dsi; d -= 2) { const y = Math.round(yOf(d)) + 0.5; ctx.moveTo(nx - rx * 1.7, y); ctx.lineTo(nx + rx * 1.7, y); }
+  for (let d = clef.bottom + 10; d <= dsi; d += 2) { const y = Math.round(yOf(d)) + 0.5; ctx.moveTo(nx - rx * 1.7, y); ctx.lineTo(nx + rx * 1.7, y); }
+  ctx.stroke();
+
+  const ink = col(hue, 90, active && c.on ? 75 : 62, dim);
+  ctx.save();
+  if (active && c.on) { ctx.shadowColor = col(hue, 100, 60); ctx.shadowBlur = u * 0.2; }
+  ctx.fillStyle = ink; ctx.strokeStyle = ink; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.ellipse(nx, ny, rx, ry, -0.35, 0, Math.PI * 2);
+  if (c.on) ctx.fill(); else ctx.stroke();                         // bypassed = hollow head
+  const up = dsi < clef.bottom + 4, sx = nx + (up ? rx * 0.93 : -rx * 0.93);
+  ctx.beginPath(); ctx.moveTo(sx, ny + (up ? -ry * 0.3 : ry * 0.3)); ctx.lineTo(sx, ny + (up ? -sp * 3.6 : sp * 3.6)); ctx.stroke();
+  ctx.restore();
+  if (acc) text('♭', nx - rx * 2.4, ny - sp * 0.2, sp * 2.6, ink);
+
+  if (active) {                                                   // playhead inside the step
+    const x = r.x + lastOf(c.id + ':N0') * u;
+    ctx.strokeStyle = col(hue, 60, 80, 0.5); ctx.beginPath(); ctx.moveTo(x, r.y + u * 0.18); ctx.lineTo(x, r.y + u * 0.86); ctx.stroke();
+  }
+  const [name, hz] = fmtNote(c.knob);
+  text(name + ' · ' + hz, r.x + u / 2, r.y + u * 0.93, u * 0.1, col(hue, 25, 60, dim));
+}
+
+function drawGlyph(kind, x, y, w, h, color) {
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+  if (kind === 'sine') for (let i = 0; i <= 24; i++) { const px = x + w * i / 24, py = y - Math.sin(i / 24 * Math.PI * 2) * h / 2; i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }
+  else { ctx.moveTo(x, y + h / 2); ctx.lineTo(x + w / 2, y - h / 2); ctx.lineTo(x + w / 2, y + h / 2); ctx.lineTo(x + w, y - h / 2); }
+  ctx.stroke();
+}
+
+function drawCube(c) {
+  const d = DEFS[c.type], r = rectOf(c);
+  const isStep = c.type === 'step', isSeq = c.type === 'seq';
+  const active = isStep && lastOf(c.id + ':N0') > 0;
+  const lit = c.type === 'clock' || isStep ? c.on : true;
+  ctx.fillStyle = active && c.on ? col(d.hue, 55, 17) : (lit ? col(d.hue, 40, 9) : col(d.hue, 10, 7));
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  ctx.lineWidth = 1; ctx.strokeStyle = col(d.hue, lit ? 70 : 15, lit ? (active ? 60 : 38) : 26);
+  ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+
+  if (d.staff) drawStaff(c, d, r, active);
+  text(d.label, r.x + u * 0.07, r.y + u * 0.1, u * 0.1, col(d.hue, 40, lit ? 70 : 40), 'left');
+  if (d.glyph) drawGlyph(d.glyph, r.x + u * 0.28, r.y + u * 0.5, u * 0.44, u * 0.3, col(d.hue, 80, 65));
+  if (d.knob) drawKnob(c, d);
+  if (d.toggle) text(d.toggle[c.on ? 1 : 0], r.x + r.w - u * 0.07, r.y + u * 0.1, u * 0.1, col(d.hue, 60, c.on ? 75 : 40), 'right');
+
+  if (c.type === 'clock') {                               // position within the whole sequence
+    const p = lastOf('clock:E');
+    ctx.fillStyle = col(d.hue, 80, 55); ctx.fillRect(r.x + u * 0.07, r.y + u * 0.96 - 3, (r.w - u * 0.14) * p, 3);
+  }
+  if (isSeq) for (let j = 0; j < c.w; j++) {              // per-column step ramp
+    const x = r.x + j * u, p = lastOf(c.id + ':S' + j), cw = u * 0.84;
+    if (j) { ctx.strokeStyle = col(d.hue, 70, 38); ctx.beginPath(); ctx.moveTo(x + 0.5, r.y); ctx.lineTo(x + 0.5, r.y + u); ctx.stroke(); }
+    ctx.fillStyle = col(d.hue, 70, 55, p > 0 ? 0.12 : 0.03); ctx.fillRect(x + u * 0.08, r.y + u * 0.2, cw, u * 0.72);
+    if (p > 0) { ctx.fillStyle = col(d.hue, 90, 60, 0.85); ctx.fillRect(x + u * 0.08, r.y + u * 0.92 - u * 0.72 * p, cw, u * 0.72 * p); }
+    text(String(j + 1), x + u / 2, r.y + u * 0.56, u * 0.3, col(d.hue, 50, p > 0 ? 95 : 55));
+  }
+}
+
+// Blunt-nosed triangle with its base on a cube's input edge: points east on a W edge, south on an N edge.
+function inputTriangle(x, y, dir, hue, b) {
+  const s = u * 0.2, hw = s * 0.62, depth = s * 0.85, tip = s * 0.14;
+  ctx.save();
+  ctx.fillStyle = col(hue, 90, 60, 0.3 + 0.7 * b);
+  if (b > 0) { ctx.shadowColor = col(hue, 100, 60); ctx.shadowBlur = 10; }
+  ctx.beginPath();
+  if (dir === 'E') { ctx.moveTo(x, y - hw); ctx.lineTo(x + depth, y - tip); ctx.lineTo(x + depth, y + tip); ctx.lineTo(x, y + hw); }
+  else { ctx.moveTo(x - hw, y); ctx.lineTo(x - tip, y + depth); ctx.lineTo(x + tip, y + depth); ctx.lineTo(x + hw, y); }
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawEdge(e, i) {
+  const pk = levels.pk[i] || 0, b = pk > 1e-9 ? 0.45 + 0.55 * Math.min(1, pk) : 0;
+  const d = DEFS[byId[e.from].type], hue = e.dir === 'E' ? d.hueE : d.hueS;
+  if (e.dir === 'E') inputTriangle(cellX(e.x + 1), cellY(e.y) + u / 2, 'E', hue, b);
+  else inputTriangle(cellX(e.x) + u / 2, cellY(e.y + 1), 'S', hue, b);
+}
+
+function frame() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cv.clientWidth, cv.clientHeight);
+  drawGrid();
+  ctx.globalAlpha = powered ? 1 : 0.55;
+  for (const s of patch.stickers) text(s.text, cellX(s.x) + u / 2, cellY(s.y) + u / 2, u * 0.16, col(210, 20, 50));
+  cubes.forEach(drawCube);
+  edges.forEach(drawEdge);
+  ctx.globalAlpha = 1;
+  if (!powered) text('press POWER to start the engine', cv.clientWidth / 2, cellY(maxY + 1) + 34, 14, col(210, 25, 60));
+  requestAnimationFrame(frame);
+}
+
+// ---- interaction
+// kind: 'staff' (a step: drag = pitch, click = bypass), 'knob' (drag the knob), 'body' (anything else)
+function pick(ev) {
+  const b = cv.getBoundingClientRect(), px = ev.clientX - b.left, py = ev.clientY - b.top;
+  for (const c of cubes) {
+    const r = rectOf(c);
+    if (px < r.x || px > r.x + r.w || py < r.y || py > r.y + r.h) continue;
+    const d = DEFS[c.type];
+    if (d.staff) return { c, d, kind: 'staff' };
+    if (d.knob) { const k = knobGeom(c); if (Math.hypot(px - k.x, py - k.y) < k.R * 1.3) return { c, d, kind: 'knob' }; }
+    return { c, d, kind: 'body' };
+  }
+  return null;
+}
+const snap = (raw, k, fine) => {
+  const q = fine ? k.step / 10 : k.step;
+  return Math.min(k.max, Math.max(k.min, Number((Math.round(raw / q) * q).toFixed(4))));
+};
+let drag = null;
+cv.addEventListener('pointerdown', ev => {
+  const h = pick(ev); if (!h) return;
+  if (h.kind === 'body') { if (h.d.toggle) dispatch({ op: 'setOn', id: h.c.id, value: !h.c.on }); return; }
+  drag = { c: h.c, k: knobOf(h.c), raw: h.c.knob, y: ev.clientY, y0: ev.clientY, moved: false, clickToggles: h.kind === 'staff' };
+  cv.setPointerCapture(ev.pointerId);
+});
+cv.addEventListener('pointermove', ev => {
+  if (drag) {
+    if (!drag.moved && Math.abs(ev.clientY - drag.y0) < 3) return;       // below 3 px it is a click, not a drag
+    drag.moved = true;
+    const k = drag.k, dy = drag.y - ev.clientY; drag.y = ev.clientY;
+    const perPx = k.px ? 1 / k.px : (k.max - k.min) / 200;
+    drag.raw = Math.min(k.max, Math.max(k.min, drag.raw + dy * perPx * (ev.shiftKey ? 0.1 : 1)));
+    const v = snap(drag.raw, k, ev.shiftKey);
+    if (v !== drag.c.knob) dispatch({ op: 'setKnob', id: drag.c.id, value: v });
+    return;
+  }
+  const h = pick(ev);
+  cv.style.cursor = !h ? 'default' : h.kind === 'body' ? (h.d.toggle ? 'pointer' : 'default') : 'ns-resize';
+});
+cv.addEventListener('pointerup', () => {
+  if (drag && !drag.moved && drag.clickToggles) dispatch({ op: 'setOn', id: drag.c.id, value: !drag.c.on });
+  drag = null;
+});
+cv.addEventListener('dblclick', ev => {
+  const h = pick(ev);
+  if (h && h.kind === 'knob') dispatch({ op: 'setKnob', id: h.c.id, value: h.c.def });
+});
+cv.addEventListener('wheel', ev => {
+  const h = pick(ev); if (!h || h.kind === 'body') return;
+  ev.preventDefault();
+  const k = knobOf(h.c), q = ev.shiftKey ? k.step / 10 : k.step;
+  const v = snap(h.c.knob - Math.sign(ev.deltaY) * q, k, ev.shiftKey);
+  if (v !== h.c.knob) dispatch({ op: 'setKnob', id: h.c.id, value: v });
+}, { passive: false });
+
+cubes.forEach(c => { if (c.type === 'step') fitClef(c); });
+layout();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
